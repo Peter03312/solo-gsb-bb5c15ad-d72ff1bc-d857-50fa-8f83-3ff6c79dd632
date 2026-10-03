@@ -712,6 +712,7 @@ function switchTab(which) {
   document.getElementById('tabProduction').classList.toggle('active', which === 'production');
   document.getElementById('tabCutting').classList.toggle('active', which === 'cutting');
   document.getElementById('tabCombo').classList.toggle('active', which === 'combo');
+  document.getElementById('tabStocktake').classList.toggle('active', which === 'stocktake');
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
   document.getElementById('viewDiff').hidden = which !== 'diff';
@@ -719,12 +720,14 @@ function switchTab(which) {
   document.getElementById('viewProduction').hidden = which !== 'production';
   document.getElementById('viewCutting').hidden = which !== 'cutting';
   document.getElementById('viewCombo').hidden = which !== 'combo';
+  document.getElementById('viewStocktake').hidden = which !== 'stocktake';
   if (which === 'published') loadPubVersions();
   if (which === 'diff') enterDiff();
   if (which === 'print') enterPrint();
   if (which === 'production') enterProduction();
   if (which === 'cutting') enterCutting();
   if (which === 'combo') enterCombo();
+  if (which === 'stocktake') enterStocktake();
 }
 
 (async function init() {
@@ -2477,3 +2480,211 @@ async function cancelCombo(id) {
 document.getElementById('tabCombo').addEventListener('click', () => switchTab('combo'));
 document.getElementById('comboDesignSelect').addEventListener('change', loadComboVersions);
 document.getElementById('btnComboPreview').addEventListener('click', previewCombo);
+
+// ================= 工作室盘点 =================
+
+const stk = {
+  materials: [],
+  sheets: [],
+  stocktakes: [],
+  detailId: null,
+};
+
+function stBanner(kind, msg) {
+  const b = document.getElementById('stBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.textContent = msg;
+  clearTimeout(stBanner._t);
+  if (kind === 'success') stBanner._t = setTimeout(() => { b.hidden = true; }, 3500);
+}
+
+async function enterStocktake() {
+  stBanner(false);
+  await Promise.all([loadStSpecs(), loadStocktakes()]);
+}
+
+async function loadStSpecs() {
+  const [m, g] = await Promise.all([api('GET', '/api/materials'), api('GET', '/api/glass-sheets')]);
+  stk.materials = m.materials;
+  stk.sheets = g.sheets;
+  renderStPickers();
+}
+
+// 两类规格的选择行：勾选 + 实盘数输入（默认填当前系统库存）
+function renderStPickers() {
+  const leadEl = document.getElementById('stLeadList');
+  if (!stk.materials.length) {
+    leadEl.innerHTML = '<div class="hint">尚未登记铅条原材（在“铅条生产”标签登记）。</div>';
+  } else {
+    let html = '<table><thead><tr><th></th><th>规格</th><th class="num">系统库存</th><th class="num">已预留</th><th class="num">实盘</th></tr></thead><tbody>';
+    for (const m of stk.materials) {
+      html += `<tr>
+        <td><input type="checkbox" id="st-cb-lead-${m.id}" style="width:auto"></td>
+        <td>${escapeHtml(m.name)}<div class="muted small">定尺 ${fmt(m.length)} mm</div></td>
+        <td class="num">${m.stock}</td>
+        <td class="num">${m.reserved}</td>
+        <td><input type="number" min="0" step="1" value="${m.stock}" id="st-count-lead-${m.id}" style="width:72px"></td>
+      </tr>`;
+    }
+    leadEl.innerHTML = html + '</tbody></table>';
+  }
+  const glassEl = document.getElementById('stGlassList');
+  if (!stk.sheets.length) {
+    glassEl.innerHTML = '<div class="hint">尚未登记玻璃原片（在“玻璃裁片”标签登记）。</div>';
+  } else {
+    let html = '<table><thead><tr><th></th><th>颜色</th><th class="num">系统库存</th><th class="num">已预留</th><th class="num">实盘</th></tr></thead><tbody>';
+    for (const s of stk.sheets) {
+      html += `<tr>
+        <td><input type="checkbox" id="st-cb-glass-${s.id}" style="width:auto"></td>
+        <td><span class="color-chip" style="background:${s.color}"></span>${s.color}<div class="muted small">${s.width}×${s.height} mm</div></td>
+        <td class="num">${s.stock}</td>
+        <td class="num">${s.reserved}</td>
+        <td><input type="number" min="0" step="1" value="${s.stock}" id="st-count-glass-${s.id}" style="width:72px"></td>
+      </tr>`;
+    }
+    glassEl.innerHTML = html + '</tbody></table>';
+  }
+}
+
+function collectStItems() {
+  const items = [];
+  for (const m of stk.materials) {
+    const cb = document.getElementById(`st-cb-lead-${m.id}`);
+    if (cb && cb.checked) {
+      items.push({ kind: 'lead', id: m.id, counted: Number(document.getElementById(`st-count-lead-${m.id}`).value) });
+    }
+  }
+  for (const s of stk.sheets) {
+    const cb = document.getElementById(`st-cb-glass-${s.id}`);
+    if (cb && cb.checked) {
+      items.push({ kind: 'glass', id: s.id, counted: Number(document.getElementById(`st-count-glass-${s.id}`).value) });
+    }
+  }
+  return items;
+}
+
+async function previewStocktake() {
+  const items = collectStItems();
+  if (!items.length) { stBanner('error', '⛔ 请至少勾选一项要盘点的规格'); return; }
+  try {
+    const data = await api('POST', '/api/stocktakes/preview', {
+      name: document.getElementById('stName').value || undefined,
+      items,
+    });
+    stk.detailId = data.stocktake.id;
+    renderStocktakeDetail(data.stocktake);
+    await loadStocktakes();
+    stBanner('success', `✓ 盘点草稿 #${data.stocktake.id} 已保存基准（库存未变更），请核对后确认`);
+  } catch (err) {
+    stBanner('error', '⛔ ' + (err.data?.error || err.message));
+  }
+}
+
+function stItemRows(items, failures) {
+  const failByKey = new Map((failures || []).map((f) => [`${f.kind}:${f.refId}`, f]));
+  let html = '';
+  for (const it of items) {
+    const f = failByKey.get(`${it.kind}:${it.refId}`);
+    const label = it.kind === 'glass'
+      ? `<span class="color-chip" style="background:${it.label}"></span>${it.label}`
+      : escapeHtml(it.label);
+    const diffCls = it.diff > 0 ? 'added' : it.diff < 0 ? 'removed' : '';
+    html += `<tr>
+      <td>${it.kindText}</td>
+      <td>${label}</td>
+      <td class="num">${it.prevStock}</td>
+      <td class="num">${it.prevReserved}</td>
+      <td class="num"><b>${it.counted}</b></td>
+      <td class="num ${diffCls}">${it.diff > 0 ? '+' : ''}${it.diff}</td>
+      <td class="num">${it.availableAfter < 0 ? `<span class="gap-info">${it.availableAfter}</span>` : it.availableAfter}</td>
+    </tr>`;
+    if (f) {
+      html += `<tr><td colspan="7"><div class="stock-badge bad">⚠ ${escapeHtml(f.reasonText)}</div></td></tr>`;
+    } else if (it.belowReserved) {
+      html += `<tr><td colspan="7"><div class="stock-badge bad">⚠ 实盘数低于基准预留 ${it.prevReserved}，确认将不通过</div></td></tr>`;
+    }
+  }
+  return html;
+}
+
+function renderStocktakeDetail(st, failures) {
+  const confirmed = st.status === 'confirmed';
+  let html = `<div class="plan-head">
+    <div><b>盘点单 #${st.id} · ${escapeHtml(st.name)}</b>
+      <span class="badge ${confirmed ? 'ok' : ''}" style="${confirmed ? '' : 'background:#fff3cd;color:#8a5a00'}">${st.statusText}</span></div>
+    <div class="muted">共 ${st.itemCount} 项（铅条 ${st.leadCount} · 玻璃 ${st.glassCount}）· 建于 ${st.createdAt}${confirmed ? ` · 确认于 ${st.confirmedAt}` : ''}</div></div>`;
+
+  html += confirmed
+    ? '<div class="stock-badge ok">✓ 已确认：各规格库存已在同一事务内一次性更新为实盘数；重复确认返回同一记录，不再调整</div>'
+    : '<div class="stock-badge" style="background:#fff3cd;color:#8a5a00;border:1px solid #e0c97a">草稿：以下为预览基准（系统库存/已确认预留取自建单时），尚未改库存</div>';
+
+  html += `<div class="cut-color-summary"><table><thead><tr>
+      <th>类别</th><th>规格</th><th class="num">系统库存</th><th class="num">已预留</th>
+      <th class="num">实盘</th><th class="num">差异</th><th class="num">盘后可用</th>
+    </tr></thead><tbody>${stItemRows(st.items, failures)}</tbody></table></div>`;
+
+  if (!confirmed) {
+    html += `<div class="btn-row"><button id="btnStConfirm" class="primary big">确认盘点（同事务重核基准并更新库存）</button></div>
+      <div class="hint">确认时逐项重核：系统库存或已确认预留与基准不符、或实盘数低于当前预留，都会整单不生效并列出原因。</div>`;
+  }
+  document.getElementById('stPreviewContent').innerHTML = html;
+  const btn = document.getElementById('btnStConfirm');
+  if (btn) btn.addEventListener('click', () => confirmStocktake(st.id));
+}
+
+async function confirmStocktake(id) {
+  try {
+    const data = await api('POST', `/api/stocktakes/${id}/confirm`);
+    stBanner('success', data.idempotent
+      ? `盘点单 #${id} 此前已确认，返回同一记录（库存未再次调整）`
+      : `✓ 盘点单 #${id} 已确认，各规格库存已更新为实盘数`);
+    await Promise.all([loadStSpecs(), loadStocktakes(id)]);
+  } catch (err) {
+    const d = err.data || {};
+    if (d.code === 'baseline_mismatch' && d.stocktake) {
+      renderStocktakeDetail(d.stocktake, d.failures || []);
+      stBanner('error', '⛔ ' + (d.error || '基准不符，整单未生效'));
+    } else {
+      stBanner('error', '⛔ ' + (d.error || err.message));
+    }
+    await loadStocktakes(id);
+  }
+}
+
+async function loadStocktakes(selectId) {
+  const data = await api('GET', '/api/stocktakes');
+  stk.stocktakes = data.stocktakes;
+  renderStList();
+  const pick = selectId || stk.detailId;
+  if (pick) {
+    const one = await api('GET', `/api/stocktakes/${pick}`);
+    renderStocktakeDetail(one.data.stocktake);
+  }
+}
+
+function renderStList() {
+  const el = document.getElementById('stList');
+  if (!stk.stocktakes.length) { el.innerHTML = '<div class="hint">暂无盘点单。</div>'; return; }
+  el.innerHTML = stk.stocktakes.map((st) => {
+    const badge = st.status === 'confirmed'
+      ? '<span class="badge ok">已确认</span>'
+      : '<span class="badge" style="background:#fff3cd;color:#8a5a00">草稿</span>';
+    return `<div class="plan-item${stk.detailId === st.id ? ' active' : ''}" data-id="${st.id}">
+      <div>${badge} <b>#${st.id}</b> ${escapeHtml(st.name)}</div>
+      <div class="muted small">${st.itemCount} 项（铅条 ${st.leadCount} · 玻璃 ${st.glassCount}）· ${st.createdAt}${st.confirmedAt ? ' · 确认于 ' + st.confirmedAt : ''}</div>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.plan-item').forEach((div) => {
+    div.addEventListener('click', async () => {
+      stk.detailId = Number(div.dataset.id);
+      renderStList();
+      const one = await api('GET', `/api/stocktakes/${stk.detailId}`);
+      renderStocktakeDetail(one.data.stocktake);
+    });
+  });
+}
+
+document.getElementById('tabStocktake').addEventListener('click', () => switchTab('stocktake'));
+document.getElementById('btnStPreview').addEventListener('click', previewStocktake);

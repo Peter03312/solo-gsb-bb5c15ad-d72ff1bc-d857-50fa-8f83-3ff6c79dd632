@@ -297,3 +297,9 @@ td.added.num, th.added.num { color: #2e7d4f; }
   font: inherit;
   padding: 0 2px;
 }
+
+/* ============ 工作室盘点 ============ */
+.st-sub { font-size: 13px; margin: 10px 0 6px; color: var(--muted); }
+#stLeadList table, #stGlassList table { font-size: 12px; }
+#stLeadList td, #stGlassList td, #stLeadList th, #stGlassList th { padding: 4px 4px; }
+#stLeadList input[type="number"], #stGlassList input[type="number"] { margin-top: 0; padding: 3px 6px; font-size: 13px; }
