@@ -177,6 +177,39 @@ function init(dbPath) {
     CREATE INDEX IF NOT EXISTS idx_cutorders_pub    ON cut_orders(publication_id);
     CREATE INDEX IF NOT EXISTS idx_cutitems_sheet   ON cut_order_items(sheet_id);
     CREATE INDEX IF NOT EXISTS idx_cutitems_order   ON cut_order_items(order_id);
+
+    -- 库存盘点单：一张单同时盘点若干铅条原材规格与玻璃原片规格。
+    -- 预览即建草稿并固化各项“预览基准”（系统库存/已确认预留），预览本身不改库存；
+    -- 确认在同一事务内按基准重核全部项：任一项基准已不符或实盘数低于当前预留则整单不生效；
+    -- 全部通过才一次更新各规格库存，并保留原值、实盘值与确认时间。
+    CREATE TABLE IF NOT EXISTS stocktakes (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      name         TEXT    NOT NULL,
+      status       TEXT    NOT NULL CHECK (status IN ('draft','confirmed')),
+      created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+      updated_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+      confirmed_at TEXT
+    );
+
+    -- 盘点项：type='lead' 为铅条原材（spec_id -> lead_materials.id）；
+    -- type='glass' 为玻璃原片（spec_id -> glass_sheets.id）。同单同类型规格唯一。
+    -- 预览时固化基线库存与已确认预留；确认后保留原值与实盘值（永久记录，库存之后再变也不回写）。
+    CREATE TABLE IF NOT EXISTS stocktake_items (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      stocktake_id      INTEGER NOT NULL REFERENCES stocktakes(id) ON DELETE CASCADE,
+      type              TEXT    NOT NULL CHECK (type IN ('lead','glass')),
+      spec_id           INTEGER NOT NULL,
+      spec_name         TEXT    NOT NULL,       -- 铅条规格名；玻璃存颜色
+      spec_length_h     INTEGER,                -- 仅铅条：定尺（厘），身份快照
+      spec_width_mm     INTEGER,                -- 仅玻璃：宽（mm），身份快照
+      spec_height_mm    INTEGER,                -- 仅玻璃：高（mm），身份快照
+      baseline_stock    INTEGER NOT NULL,       -- 预览时系统库存
+      baseline_reserved INTEGER NOT NULL,       -- 预览时已确认独立单+整套单预留
+      counted_stock     INTEGER NOT NULL CHECK (counted_stock >= 0), -- 实盘总数
+      UNIQUE (stocktake_id, type, spec_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_stockitems_st ON stocktake_items(stocktake_id);
   `);
 
   // 旧库迁移：早期 cut_orders 的状态 CHECK 不含 'replaced'，也没有 replaced_at 列。
@@ -1222,6 +1255,259 @@ function cancelComboOrder(id) {
   }
 }
 
+// ---------- 库存盘点（铅条 + 玻璃 同一张盘点单） ----------
+
+function rowToStocktake(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    confirmedAt: row.confirmed_at || null,
+  };
+}
+
+function getStocktakeRow(id) {
+  return getDb().prepare('SELECT * FROM stocktakes WHERE id = ?').get(id);
+}
+
+function getStocktake(id) {
+  return rowToStocktake(getStocktakeRow(id));
+}
+
+function listStocktakes() {
+  return getDb().prepare('SELECT * FROM stocktakes ORDER BY id DESC').all().map(rowToStocktake);
+}
+
+function listStocktakeItemRows(stocktakeId) {
+  return getDb()
+    .prepare('SELECT * FROM stocktake_items WHERE stocktake_id = ? ORDER BY id')
+    .all(stocktakeId);
+}
+
+// 单规格当前已被已确认计划/订单预留的数量（独立单与整套单关联单同一口径，按状态计）。
+function leadReservedFor(materialId) {
+  return getDb()
+    .prepare("SELECT COALESCE(SUM(required_bars),0) AS n FROM lead_plans WHERE material_id = ? AND status = 'confirmed'")
+    .get(materialId).n;
+}
+
+function glassReservedFor(sheetId) {
+  return getDb()
+    .prepare(`SELECT COALESCE(SUM(i.required_sheets),0) AS n
+              FROM cut_order_items i JOIN cut_orders o ON o.id = i.order_id
+              WHERE i.sheet_id = ? AND o.status = 'confirmed'`).get(sheetId).n;
+}
+
+// 生成某一项的预览基准（系统库存、已确认预留、规格身份快照）。
+// 规格不存在返回 { code:'not_found' }。
+function stocktakeBaseline(type, specId) {
+  if (type === 'lead') {
+    const m = getMaterialRow(specId);
+    if (!m) return { code: 'not_found' };
+    return {
+      specName: m.name, specLengthH: m.length_h,
+      specWidthMm: null, specHeightMm: null,
+      stock: m.stock, reserved: leadReservedFor(specId),
+    };
+  }
+  const s = getGlassSheetRow(specId);
+  if (!s) return { code: 'not_found' };
+  return {
+    specName: s.color, specLengthH: null,
+    specWidthMm: s.width_mm, specHeightMm: s.height_mm,
+    stock: s.stock, reserved: glassReservedFor(specId),
+  };
+}
+
+// 建草稿盘点单并固化各项预览基准（同一事务）。
+// items: [{type:'lead'|'glass', specId, counted}]（调用方已校验非空、不重复、实盘非负整数）。
+function createStocktake({ name, items }) {
+  const d = getDb();
+  const txn = d.transaction(() => {
+    // 取基准（事务内）；规格不存在或同单重复均整体拒绝，不落任何记录
+    const rows = items.map((it) => {
+      const b = stocktakeBaseline(it.type, it.specId);
+      if (b.code === 'not_found') {
+        return { fail: { code: 'not_found', type: it.type, specId: it.specId } };
+      }
+      return { ...it, ...b };
+    });
+    const failed = rows.find((r) => r.fail);
+    if (failed) return failed.fail;
+
+    const info = d.prepare("INSERT INTO stocktakes (name, status) VALUES (?, 'draft')").run(name);
+    const id = info.lastInsertRowid;
+    const ins = d.prepare(`INSERT INTO stocktake_items
+      (stocktake_id, type, spec_id, spec_name, spec_length_h, spec_width_mm, spec_height_mm,
+       baseline_stock, baseline_reserved, counted_stock)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    for (const r of rows) {
+      ins.run(id, r.type, r.specId, r.specName, r.specLengthH, r.specWidthMm, r.specHeightMm,
+        r.stock, r.reserved, r.counted);
+    }
+    return { code: 'ok', id };
+  });
+  return txn.immediate();
+}
+
+// 修改草稿盘点单（换规格/改实盘数）：按新的项重新固化预览基准。
+// 已确认盘点单不可修改；草稿删除后重写全部项。
+function updateStocktakeDraft(id, { name, items }) {
+  const d = getDb();
+  const txn = d.transaction(() => {
+    const row = getStocktakeRow(id);
+    if (!row) return { code: 'not_found' };
+    if (row.status === 'confirmed') return { code: 'already_confirmed' };
+
+    const rows = items.map((it) => {
+      const b = stocktakeBaseline(it.type, it.specId);
+      if (b.code === 'not_found') {
+        return { fail: { code: 'not_found', type: it.type, specId: it.specId } };
+      }
+      return { ...it, ...b };
+    });
+    const failed = rows.find((r) => r.fail);
+    if (failed) return failed.fail;
+
+    d.prepare("UPDATE stocktakes SET name = ?, updated_at = datetime('now') WHERE id = ?").run(name, id);
+    d.prepare('DELETE FROM stocktake_items WHERE stocktake_id = ?').run(id);
+    const ins = d.prepare(`INSERT INTO stocktake_items
+      (stocktake_id, type, spec_id, spec_name, spec_length_h, spec_width_mm, spec_height_mm,
+       baseline_stock, baseline_reserved, counted_stock)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    for (const r of rows) {
+      ins.run(id, r.type, r.specId, r.specName, r.specLengthH, r.specWidthMm, r.specHeightMm,
+        r.stock, r.reserved, r.counted);
+    }
+    return { code: 'ok' };
+  });
+  return txn.immediate();
+}
+
+// 确认盘点：一个 BEGIN IMMEDIATE 事务内对所有项重核库存与预留：
+//   1) 规格必须仍存在（spec_missing）、规格身份未变（spec_changed：铅条定尺/玻璃宽高）；
+//   2) 当前系统库存必须与预览基准一致（stock_changed）；
+//   3) 当前已确认预留必须与预览基准一致（reserved_changed）；
+//   4) 实盘数不得低于当前预留（below_reserved）；
+// 任一项不符即整单不生效（返回全部问题项及原因），全部通过才一次更新各规格库存并置为已确认。
+// 已确认单重复确认幂等返回原单（idempotent），不再调整库存。
+function confirmStocktake(id) {
+  const d = getDb();
+  const row = getStocktakeRow(id);
+  if (!row) return { code: 'not_found' };
+  if (row.status === 'confirmed') return { code: 'idempotent' };
+
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    const cur = getStocktakeRow(id);
+    if (!cur) { d.exec('ROLLBACK'); return { code: 'not_found' }; }
+    if (cur.status === 'confirmed') { d.exec('ROLLBACK'); return { code: 'idempotent' }; }
+
+    const itemRows = listStocktakeItemRows(id);
+    const problems = [];
+    for (const it of itemRows) {
+      if (it.type === 'lead') {
+        const m = getMaterialRow(it.spec_id);
+        if (!m) { problems.push(problem(it, 'spec_missing', '规格已不存在')); continue; }
+        if (m.length_h !== it.spec_length_h) {
+          problems.push(problem(it, 'spec_changed', '原材定尺与预览基准不一致'));
+          continue;
+        }
+        const reserved = leadReservedFor(it.spec_id);
+        if (m.stock !== it.baseline_stock) {
+          problems.push(problem(it, 'stock_changed', '系统库存与预览基准不一致（预览后库存已变动）',
+            { currentStock: m.stock, currentReserved: reserved }));
+          continue;
+        }
+        if (reserved !== it.baseline_reserved) {
+          problems.push(problem(it, 'reserved_changed', '已确认预留与预览基准不一致（预览后有计划/订单确认或取消）',
+            { currentStock: m.stock, currentReserved: reserved }));
+          continue;
+        }
+        if (it.counted_stock < reserved) {
+          problems.push(problem(it, 'below_reserved', '实盘数低于当前已确认预留，不能按此盘点',
+            { currentStock: m.stock, currentReserved: reserved }));
+        }
+      } else {
+        const s = getGlassSheetRow(it.spec_id);
+        if (!s) { problems.push(problem(it, 'spec_missing', '颜色原片规格已不存在')); continue; }
+        if (s.width_mm !== it.spec_width_mm || s.height_mm !== it.spec_height_mm) {
+          problems.push(problem(it, 'spec_changed', '原片宽高与预览基准不一致'));
+          continue;
+        }
+        const reserved = glassReservedFor(it.spec_id);
+        if (s.stock !== it.baseline_stock) {
+          problems.push(problem(it, 'stock_changed', '系统库存与预览基准不一致（预览后库存已变动）',
+            { currentStock: s.stock, currentReserved: reserved }));
+          continue;
+        }
+        if (reserved !== it.baseline_reserved) {
+          problems.push(problem(it, 'reserved_changed', '已确认预留与预览基准不一致（预览后有订单确认或取消）',
+            { currentStock: s.stock, currentReserved: reserved }));
+          continue;
+        }
+        if (it.counted_stock < reserved) {
+          problems.push(problem(it, 'below_reserved', '实盘数低于当前已确认预留，不能按此盘点',
+            { currentStock: s.stock, currentReserved: reserved }));
+        }
+      }
+    }
+    if (problems.length) {
+      d.exec('ROLLBACK');
+      return { code: 'baseline_mismatch', items: problems };
+    }
+
+    // 全部通过：一次更新各规格库存（独立计划、裁片订单与整套单随后按盘点后库存计算可用量）
+    for (const it of itemRows) {
+      if (it.type === 'lead') {
+        d.prepare("UPDATE lead_materials SET stock = ?, updated_at = datetime('now') WHERE id = ?")
+          .run(it.counted_stock, it.spec_id);
+      } else {
+        d.prepare("UPDATE glass_sheets SET stock = ?, updated_at = datetime('now') WHERE id = ?")
+          .run(it.counted_stock, it.spec_id);
+      }
+    }
+    d.prepare(`UPDATE stocktakes SET status = 'confirmed', confirmed_at = datetime('now'),
+      updated_at = datetime('now') WHERE id = ?`).run(id);
+    d.exec('COMMIT');
+    return { code: 'ok' };
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+function problem(it, reason, message, extra = {}) {
+  return {
+    itemId: it.id,
+    type: it.type,
+    specId: it.spec_id,
+    reason,
+    message,
+    baselineStock: it.baseline_stock,
+    baselineReserved: it.baseline_reserved,
+    countedStock: it.counted_stock,
+    ...extra,
+  };
+}
+
+// 删除盘点单：仅草稿可删（已确认为永久记录，仅可查阅）。
+function deleteStocktake(id) {
+  const row = getStocktakeRow(id);
+  if (!row) return { code: 'not_found' };
+  if (row.status === 'confirmed') return { code: 'confirmed_delete_blocked' };
+  const d = getDb();
+  const txn = d.transaction(() => {
+    d.prepare('DELETE FROM stocktake_items WHERE stocktake_id = ?').run(id);
+    d.prepare('DELETE FROM stocktakes WHERE id = ?').run(id);
+  });
+  txn();
+  return { code: 'ok' };
+}
+
 module.exports = {
   init, getDb,
   createDesign, getDesign, listDesigns,
@@ -1235,4 +1521,7 @@ module.exports = {
   confirmCutOrder, cancelCutOrder, deleteCutOrder,
   getReplacementByOldOrder, getReplacementByNewOrder, replaceCutOrder,
   createComboOrder, getComboOrder, listComboOrders, cancelComboOrder,
+  createStocktake, updateStocktakeDraft, confirmStocktake, deleteStocktake,
+  getStocktake, getStocktakeRow, listStocktakes, listStocktakeItemRows,
+  leadReservedFor, glassReservedFor,
 };

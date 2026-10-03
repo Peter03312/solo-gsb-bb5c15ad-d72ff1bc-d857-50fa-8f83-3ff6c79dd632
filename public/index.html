@@ -17,6 +17,7 @@
       <button id="tabProduction" class="tab">铅条生产</button>
       <button id="tabCutting" class="tab">玻璃裁片</button>
       <button id="tabCombo" class="tab">整套备料</button>
+      <button id="tabStocktake" class="tab">库存盘点</button>
     </nav>
   </header>
 
@@ -377,6 +378,40 @@
       <div id="comboPreviewBox" class="lead-panel">
         <h2>整套预览 / 整套单详情</h2>
         <div id="comboPreviewContent" class="hint">在左侧选择发布版本、件数、铅条原材与刀损、玻璃片间距，点击“整套预览”。</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ 库存盘点视图 ============ -->
+  <main id="viewStocktake" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>① 新建盘点单</h2>
+        <div class="form-row">
+          <label>盘点单名称<input id="stName" type="text" placeholder="留空自动命名" maxlength="80"></label>
+        </div>
+        <div class="hint">勾选要盘点的铅条原材与玻璃原片规格，逐项录入实盘总数（非负整数，同单规格不重复）；可只盘其中几项。</div>
+        <h3>铅条原材</h3>
+        <div id="stLeadList"></div>
+        <h3>玻璃原片</h3>
+        <div id="stGlassList"></div>
+        <div class="btn-row">
+          <button id="btnStPreview" class="primary big">预览盘点（不改库存）</button>
+        </div>
+        <div id="stMsg" class="hint">预览会保存各项当时的系统库存、已确认预留、差异与实盘后可用量；确认时在同一事务内重核，任一项已变化或实盘数低于当前预留则整单不生效。</div>
+      </section>
+
+      <section>
+        <h2>② 盘点单</h2>
+        <div id="stList"></div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="stBanner" class="banner" hidden></div>
+      <div class="lead-panel">
+        <h2>盘点预览 / 盘点单详情</h2>
+        <div id="stDetail" class="hint">在左侧勾选规格并录入实盘数，点击“预览盘点”。</div>
       </div>
     </section>
   </main>

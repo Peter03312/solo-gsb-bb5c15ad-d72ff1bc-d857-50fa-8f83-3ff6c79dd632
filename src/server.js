@@ -1771,6 +1771,244 @@ function serializeCutOrder(order) {
   };
 }
 
+// ---------- 库存盘点（同一张盘点单盘点铅条原材 + 玻璃原片） ----------
+
+const STOCKTAKE_NAME_MAX = 80;
+const STOCKTAKE_ITEMS_MAX = 200;
+
+function stocktakeStatusZh(status) {
+  return status === 'draft' ? '草稿' : '已确认';
+}
+
+// 解析盘点项：[{type:'lead'|'glass', specId, counted}]
+// 非空、type 合法、specId 正整数、实盘为非负整数、同类型规格不得重复。
+function parseStocktakeItems(body) {
+  const items = body?.items;
+  if (!Array.isArray(items) || items.length === 0) {
+    return { error: 'items 必填：至少选择一个盘点规格（铅条原材或玻璃原片）' };
+  }
+  if (items.length > STOCKTAKE_ITEMS_MAX) {
+    return { error: `一张盘点单最多 ${STOCKTAKE_ITEMS_MAX} 项` };
+  }
+  const parsed = [];
+  const seen = new Set();
+  for (const raw of items) {
+    if (!raw || typeof raw !== 'object') return { error: '每个盘点项必须是对象 {type, specId, counted}' };
+    const type = raw.type === 'lead' ? 'lead' : raw.type === 'glass' ? 'glass' : null;
+    if (!type) return { error: '盘点项 type 必须是 "lead"（铅条原材）或 "glass"（玻璃原片）' };
+    const specId = Number(raw.specId);
+    if (!Number.isInteger(specId) || specId <= 0) {
+      return { error: '盘点项 specId 必须是规格的正整数 id' };
+    }
+    const countedR = cut.parseNonNegInt(Number(raw.counted), { name: '实盘总数' });
+    if (!countedR.ok) return { error: countedR.error };
+    const key = `${type}:${specId}`;
+    if (seen.has(key)) {
+      return {
+        error: type === 'lead'
+          ? `铅条原材规格 #${specId} 在同一张盘点单中重复出现`
+          : `玻璃原片规格 #${specId} 在同一张盘点单中重复出现`,
+        code: 'duplicate_spec',
+      };
+    }
+    seen.add(key);
+    parsed.push({ type, specId, counted: countedR.n });
+  }
+  return { items: parsed };
+}
+
+// 盘点项输出：
+//   记录口径（永久）：预览基准 stock/reserved、实盘 counted、差异 diff、实盘后可用量 availableAfterCount；
+//   实时口径（current*）：确认前若库存/预留已漂移可直接看出；确认后反映盘点后的库存。
+function serializeStocktakeItem(row) {
+  const base = {
+    itemId: row.id,
+    type: row.type,
+    specId: row.spec_id,
+    counted: row.counted_stock,
+    stock: row.baseline_stock,          // 预览时系统库存（记录原值）
+    reserved: row.baseline_reserved,    // 预览时已确认预留
+    diff: row.counted_stock - row.baseline_stock,
+    availableAfterCount: row.counted_stock - row.baseline_reserved,
+  };
+  if (row.type === 'lead') {
+    const length = row.spec_length_h === null ? null : row.spec_length_h / 100;
+    const live = db.getMaterial(row.spec_id);
+    if (live) {
+      return {
+        ...base,
+        name: live.name,
+        label: live.name,
+        length,
+        currentStock: live.stock,
+        currentReserved: live.reserved,
+        currentAvailable: live.available,
+      };
+    }
+    return {
+      ...base,
+      name: row.spec_name,
+      label: row.spec_name,
+      length,
+      currentStock: null, currentReserved: null, currentAvailable: null,
+      unavailable: true,
+    };
+  }
+  const live = db.getGlassSheet(row.spec_id);
+  if (live) {
+    return {
+      ...base,
+      name: live.color,
+      color: live.color,
+      width: live.width,
+      height: live.height,
+      currentStock: live.stock,
+      currentReserved: live.reserved,
+      currentAvailable: live.available,
+    };
+  }
+  return {
+    ...base,
+    name: row.spec_name,
+    color: row.spec_name,
+    width: row.spec_width_mm,
+    height: row.spec_height_mm,
+    currentStock: null, currentReserved: null, currentAvailable: null,
+    unavailable: true,
+  };
+}
+
+function serializeStocktake(rowLike, itemRows) {
+  const items = itemRows.map(serializeStocktakeItem);
+  const leadItems = items.filter((i) => i.type === 'lead');
+  const glassItems = items.filter((i) => i.type === 'glass');
+  return {
+    id: rowLike.id,
+    name: rowLike.name,
+    status: rowLike.status,
+    statusText: stocktakeStatusZh(rowLike.status),
+    itemCount: items.length,
+    leadCount: leadItems.length,
+    glassCount: glassItems.length,
+    items,
+    createdAt: rowLike.createdAt || rowLike.created_at,
+    updatedAt: rowLike.updatedAt || rowLike.updated_at,
+    confirmedAt: rowLike.confirmedAt || rowLike.confirmed_at || null,
+  };
+}
+
+function loadStocktakeSerialized(id) {
+  const row = db.getStocktakeRow(id);
+  if (!row) return null;
+  return serializeStocktake(row, db.listStocktakeItemRows(id));
+}
+
+// 预览：建草稿盘点单并固化各项当时的系统库存/预留/差异/实盘后可用量（不改库存）。
+app.post('/api/stocktakes/preview', (req, res) => {
+  const body = req.body || {};
+  const pr = parseStocktakeItems(body);
+  if (pr.error) return fail(res, 400, pr.error, pr.code ? { code: pr.code } : {});
+  const name = typeof body.name === 'string' && body.name.trim()
+    ? body.name.trim().slice(0, STOCKTAKE_NAME_MAX)
+    : `库存盘点（${pr.items.length} 项）`;
+  const r = db.createStocktake({ name, items: pr.items });
+  if (r.code === 'not_found') {
+    return fail(res, 404, r.type === 'lead'
+      ? `铅条原材规格 #${r.specId} 不存在`
+      : `玻璃原片规格 #${r.specId} 不存在`);
+  }
+  res.status(201).json({ ok: true, stocktake: loadStocktakeSerialized(r.id) });
+});
+
+app.get('/api/stocktakes', (req, res) => {
+  const list = db.listStocktakes().map((s) => {
+    const itemRows = db.listStocktakeItemRows(s.id);
+    return {
+      ...s,
+      statusText: stocktakeStatusZh(s.status),
+      itemCount: itemRows.length,
+      leadCount: itemRows.filter((i) => i.type === 'lead').length,
+      glassCount: itemRows.filter((i) => i.type === 'glass').length,
+    };
+  });
+  res.json({ ok: true, stocktakes: list });
+});
+
+app.get('/api/stocktakes/:id', (req, res) => {
+  const s = loadStocktakeSerialized(Number(req.params.id));
+  if (!s) return fail(res, 404, '盘点单不存在');
+  res.json({ ok: true, stocktake: s });
+});
+
+// 修改草稿：重选规格/改实盘数并重新固化预览基准（已确认单不可改）。
+app.put('/api/stocktakes/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (!db.getStocktakeRow(id)) return fail(res, 404, '盘点单不存在');
+  const body = req.body || {};
+  const pr = parseStocktakeItems(body);
+  if (pr.error) return fail(res, 400, pr.error, pr.code ? { code: pr.code } : {});
+  const name = typeof body.name === 'string' && body.name.trim()
+    ? body.name.trim().slice(0, STOCKTAKE_NAME_MAX)
+    : `库存盘点（${pr.items.length} 项）`;
+  const r = db.updateStocktakeDraft(id, { name, items: pr.items });
+  if (r.code === 'not_found') return fail(res, 404, '盘点单不存在');
+  if (r.code === 'already_confirmed') {
+    return res.status(409).json({
+      ok: false, code: 'already_confirmed',
+      error: '盘点单已确认，盘点记录不可修改（请新建盘点单）',
+      stocktake: loadStocktakeSerialized(id),
+    });
+  }
+  res.json({ ok: true, stocktake: loadStocktakeSerialized(id) });
+});
+
+// 确认盘点：同一事务重核所有选中规格的库存与预留；任一不符或实盘数低于当前预留，
+// 返回该项及原因，整单不生效；全部通过才一次更新库存。已确认单重复提交返回同一记录。
+app.post('/api/stocktakes/:id/confirm', (req, res) => {
+  const id = Number(req.params.id);
+  if (!db.getStocktakeRow(id)) return fail(res, 404, '盘点单不存在');
+  const r = db.confirmStocktake(id);
+  if (r.code === 'not_found') return fail(res, 404, '盘点单不存在');
+  if (r.code === 'idempotent') {
+    return res.status(200).json({
+      ok: true, idempotent: true,
+      message: '该盘点单此前已确认，返回同一记录，未再次调整库存',
+      stocktake: loadStocktakeSerialized(id),
+    });
+  }
+  if (r.code === 'baseline_mismatch') {
+    const reasonsZh = {
+      spec_missing: '规格已不存在',
+      spec_changed: '规格身份与预览基准不一致',
+      stock_changed: '系统库存与预览基准不符',
+      reserved_changed: '已确认预留与预览基准不符',
+      below_reserved: '实盘数低于当前预留',
+    };
+    return res.status(409).json({
+      ok: false,
+      code: 'baseline_mismatch',
+      error: '盘点确认失败：预览基准已变化或实盘数低于当前预留，整单未生效（库存未改动）',
+      items: r.items.map((it) => ({
+        ...it,
+        typeName: it.type === 'lead' ? '铅条原材' : '玻璃原片',
+        reasonText: reasonsZh[it.reason] || it.reason,
+      })),
+      stocktake: loadStocktakeSerialized(id),
+    });
+  }
+  res.status(200).json({ ok: true, idempotent: false, stocktake: loadStocktakeSerialized(id) });
+});
+
+// 删除草稿盘点单（已确认为永久记录，不可删除）。
+app.delete('/api/stocktakes/:id', (req, res) => {
+  const r = db.deleteStocktake(Number(req.params.id));
+  if (r.code === 'not_found') return fail(res, 404, '盘点单不存在');
+  if (r.code === 'confirmed_delete_blocked') {
+    return fail(res, 409, '已确认盘点单为永久记录，不能删除（仅可查阅）');
+  }
+  res.json({ ok: true });
+});
+
 // 前端单页
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
